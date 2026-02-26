@@ -51,15 +51,16 @@ RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
+# Hana gateway config: copy trusted-proxy auth config into the image
+USER root
+RUN mkdir -p /root/.openclaw
+COPY docker/openclaw.json /root/.openclaw/openclaw.json
+
 # Security hardening: Run as non-root user
 # The node:22-bookworm image includes a 'node' user (uid 1000)
 # This reduces the attack surface by preventing container escape via root privileges
 USER node
 
-# Start gateway server with default config.
-# Binds to loopback (127.0.0.1) by default for security.
-#
-# For container platforms requiring external health checks:
-#   1. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD env var
-#   2. Override CMD: ["node","openclaw.mjs","gateway","--allow-unconfigured","--bind","lan"]
-CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+# Start gateway server (openclaw.json provides auth config; no --allow-unconfigured needed)
+# Binds to LAN for ECS/container health checks.
+CMD ["node", "openclaw.mjs", "gateway", "--bind", "lan"]

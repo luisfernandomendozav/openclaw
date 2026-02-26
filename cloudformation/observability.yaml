@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA Observability Infrastructure - CloudWatch, X-Ray, SNS Alerts
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  # SNS Topic for Alarms
+  AlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Environment}-alarms
+      DisplayName: HANA Alarms
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AlarmsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlarmsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmsTopic
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmsTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # CloudWatch Dashboard
+  MainDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-${Environment}-overview
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "ECS Service CPU",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ClusterName", "${ProjectName}-${Environment}", "ServiceName", "${ProjectName}-${Environment}-api"],
+                  ["...", "${ProjectName}-${Environment}-ws"],
+                  ["...", "${ProjectName}-${Environment}-workers"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "ECS Service Memory",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ECS", "MemoryUtilization", "ClusterName", "${ProjectName}-${Environment}", "ServiceName", "${ProjectName}-${Environment}-api"],
+                  ["...", "${ProjectName}-${Environment}-ws"],
+                  ["...", "${ProjectName}-${Environment}-workers"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "ALB Request Count",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ProjectName}-${Environment}-alb"]
+                ],
+                "stat": "Sum",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "ALB Response Time",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${ProjectName}-${Environment}-alb"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "RDS CPU",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${ProjectName}-${Environment}-postgres"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 12,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "RDS Connections",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${ProjectName}-${Environment}-postgres"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 12,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Redis Memory",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ElastiCache", "DatabaseMemoryUsagePercentage", "ReplicationGroupId", "${ProjectName}-${Environment}-redis"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "SQS Queue Depth",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ProjectName}-${Environment}-agent-runs.fifo"],
+                  ["...", "${ProjectName}-${Environment}-agent-runs-dlq.fifo"]
+                ],
+                "stat": "Average",
+                "period": 60
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Recent Errors",
+                "region": "${AWS::Region}",
+                "query": "SOURCE '/ecs/${ProjectName}-${Environment}/api' | SOURCE '/ecs/${ProjectName}-${Environment}/ws' | SOURCE '/ecs/${ProjectName}-${Environment}/workers' | filter @message like /ERROR/ | sort @timestamp desc | limit 20"
+              }
+            }
+          ]
+        }
+
+  # ECS Service Alarms
+  ApiServiceCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-api-cpu-high
+      AlarmDescription: API service CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Sub ${ProjectName}-${Environment}
+        - Name: ServiceName
+          Value: !Sub ${ProjectName}-${Environment}-api
+      AlarmActions:
+        - !Ref AlarmsTopic
+      OKActions:
+        - !Ref AlarmsTopic
+
+  ApiServiceMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-api-memory-high
+      AlarmDescription: API service memory utilization is high
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Sub ${ProjectName}-${Environment}
+        - Name: ServiceName
+          Value: !Sub ${ProjectName}-${Environment}-api
+      AlarmActions:
+        - !Ref AlarmsTopic
+
+  # ALB Alarms
+  ALB5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-alb-5xx-errors
+      AlarmDescription: ALB is returning 5xx errors
+      MetricName: HTTPCode_ELB_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmsTopic
+
+  ALBLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-alb-latency-high
+      AlarmDescription: ALB response time is high
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmsTopic
+
+  # Unhealthy Hosts Alarm
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-unhealthy-hosts
+      AlarmDescription: There are unhealthy hosts in the target group
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmsTopic
+
+  # Log Metric Filters for error tracking
+  ErrorLogMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/api
+      FilterPattern: 'ERROR'
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: !Sub ${ProjectName}/${Environment}
+          MetricValue: '1'
+          DefaultValue: 0
+
+  ErrorCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-error-count-high
+      AlarmDescription: High number of errors in API logs
+      MetricName: ErrorCount
+      Namespace: !Sub ${ProjectName}/${Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !If [IsProd, 50, 100]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmsTopic
+
+Outputs:
+  AlarmsTopicArn:
+    Description: SNS Topic ARN for alarms
+    Value: !Ref AlarmsTopic
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AlarmsTopicArn
+
+  DashboardName:
+    Description: CloudWatch Dashboard name
+    Value: !Ref MainDashboard
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DashboardName
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MainDashboard}'

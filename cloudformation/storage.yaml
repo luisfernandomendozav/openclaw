@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA Storage Infrastructure - S3 Buckets and ECR Repositories
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # ECR Repository for API/WS/Workers (single image, multi-service)
+  ApiRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}/api
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for media uploads
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-media-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProd, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: ExpireOldVersions
+            Status: !If [IsProd, Enabled, Disabled]
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for exports (conversation transcripts, reports)
+  ExportsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-exports-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireExports
+            Status: Enabled
+            ExpirationInDays: !If [IsProd, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for CloudFormation templates and deployment artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-artifacts-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Bucket policy for ALB access logs (optional)
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceSSL
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub ${MediaBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+Outputs:
+  ApiRepositoryUri:
+    Description: ECR Repository URI for API
+    Value: !GetAtt ApiRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiECRUri
+
+  ApiRepositoryArn:
+    Description: ECR Repository ARN for API
+    Value: !GetAtt ApiRepository.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiECRArn
+
+  MediaBucketName:
+    Description: S3 Bucket name for media
+    Value: !Ref MediaBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-MediaBucketName
+
+  MediaBucketArn:
+    Description: S3 Bucket ARN for media
+    Value: !GetAtt MediaBucket.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-MediaBucketArn
+
+  ExportsBucketName:
+    Description: S3 Bucket name for exports
+    Value: !Ref ExportsBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ExportsBucketName
+
+  ExportsBucketArn:
+    Description: S3 Bucket ARN for exports
+    Value: !GetAtt ExportsBucket.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ExportsBucketArn
+
+  ArtifactsBucketName:
+    Description: S3 Bucket name for artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ArtifactsBucketName

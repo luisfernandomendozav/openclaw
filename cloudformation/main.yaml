@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA Master Stack - Orchestrates all nested stacks
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    Description: RDS instance class
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r6g.large
+      - db.r6g.xlarge
+
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.medium
+    Description: ElastiCache node type
+    AllowedValues:
+      - cache.t4g.micro
+      - cache.t4g.small
+      - cache.t4g.medium
+      - cache.r6g.large
+      - cache.r6g.xlarge
+
+  ApiCpu:
+    Type: Number
+    Default: 512
+    Description: CPU units for API service
+
+  ApiMemory:
+    Type: Number
+    Default: 1024
+    Description: Memory (MB) for API service
+
+  ApiDesiredCount:
+    Type: Number
+    Default: 1
+    Description: Desired number of API tasks
+
+  WorkersCpu:
+    Type: Number
+    Default: 512
+    Description: CPU units for Workers service
+
+  WorkersMemory:
+    Type: Number
+    Default: 1024
+    Description: Memory (MB) for Workers service
+
+  WorkersDesiredCount:
+    Type: Number
+    Default: 1
+    Description: Desired number of Worker tasks
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+
+  RateLimitPerIP:
+    Type: Number
+    Default: 2000
+    Description: Rate limit per IP address (requests per 5 minutes)
+
+  TemplatesBucket:
+    Type: String
+    Description: S3 bucket containing CloudFormation templates
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General Configuration
+        Parameters:
+          - ProjectName
+          - Environment
+          - TemplatesBucket
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCIDR
+      - Label:
+          default: Database Configuration
+        Parameters:
+          - DBInstanceClass
+          - RedisNodeType
+      - Label:
+          default: Compute Configuration
+        Parameters:
+          - ApiCpu
+          - ApiMemory
+          - ApiDesiredCount
+          - WorkersCpu
+          - WorkersMemory
+          - WorkersDesiredCount
+      - Label:
+          default: Security Configuration
+        Parameters:
+          - RateLimitPerIP
+      - Label:
+          default: Monitoring
+        Parameters:
+          - AlarmEmail
+
+Resources:
+  # Network Stack
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/network.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        VpcCIDR: !Ref VpcCIDR
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Storage Stack
+  StorageStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/storage.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Secrets Stack
+  SecretsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/secrets.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Messaging Stack
+  MessagingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/messaging.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Database Stack (depends on Network and Secrets)
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - SecretsStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/database.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        DBInstanceClass: !Ref DBInstanceClass
+        RedisNodeType: !Ref RedisNodeType
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Stack (depends on Storage, Messaging)
+  IAMStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - StorageStack
+      - MessagingStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/iam.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Compute Stack (depends on Network, Storage, Secrets, Messaging, Database, IAM)
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - StorageStack
+      - SecretsStack
+      - MessagingStack
+      - DatabaseStack
+      - IAMStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/compute.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ApiCpu: !Ref ApiCpu
+        ApiMemory: !Ref ApiMemory
+        ApiDesiredCount: !Ref ApiDesiredCount
+        WorkersCpu: !Ref WorkersCpu
+        WorkersMemory: !Ref WorkersMemory
+        WorkersDesiredCount: !Ref WorkersDesiredCount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # WAF Stack (depends on Compute for ALB)
+  WAFStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ComputeStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/waf.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        RateLimitPerIP: !Ref RateLimitPerIP
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Observability Stack (depends on Compute)
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ComputeStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/observability.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        AlarmEmail: !Ref AlarmEmail
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !GetAtt NetworkStack.Outputs.VpcId
+
+  ALBDNSName:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt ComputeStack.Outputs.ALBDNSName
+
+  ApiECRUri:
+    Description: ECR Repository URI for API
+    Value: !GetAtt StorageStack.Outputs.ApiRepositoryUri
+
+  RDSEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt DatabaseStack.Outputs.RDSEndpoint
+
+  RedisEndpoint:
+    Description: Redis endpoint
+    Value: !GetAtt DatabaseStack.Outputs.RedisEndpoint
+
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !GetAtt ComputeStack.Outputs.ClusterName
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !GetAtt ObservabilityStack.Outputs.DashboardUrl
+
+  MediaBucketName:
+    Description: S3 Bucket for media uploads
+    Value: !GetAtt StorageStack.Outputs.MediaBucketName

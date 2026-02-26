@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA Compute Infrastructure - ECS Cluster, ALB, and Fargate Services
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  ApiCpu:
+    Type: Number
+    Default: 512
+    Description: CPU units for API service (256, 512, 1024, 2048, 4096)
+
+  ApiMemory:
+    Type: Number
+    Default: 1024
+    Description: Memory (MB) for API service
+
+  ApiDesiredCount:
+    Type: Number
+    Default: 0
+    Description: Desired number of API tasks (set to 0 until image is pushed)
+
+  WorkersCpu:
+    Type: Number
+    Default: 512
+    Description: CPU units for Workers service
+
+  WorkersMemory:
+    Type: Number
+    Default: 1024
+    Description: Memory (MB) for Workers service
+
+  WorkersDesiredCount:
+    Type: Number
+    Default: 0
+    Description: Desired number of Worker tasks (set to 0 until image is pushed)
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${Environment}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !If [IsProd, 0, 2]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-alb
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-ALBSecurityGroupId
+      Subnets:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-PublicSubnet1Id
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-PublicSubnet2Id
+      LoadBalancerAttributes:
+        # Increase idle timeout for WebSocket connections
+        - Key: idle_timeout.timeout_seconds
+          Value: '3600'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        # Preserve x-forwarded-* headers for trusted-proxy auth
+        - Key: routing.http.xff_header_processing.mode
+          Value: 'append'
+        # Enable HTTP/2 for better WebSocket performance
+        - Key: routing.http2.enabled
+          Value: 'true'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # HTTP Listener (forwards to API for dev, use HTTPS in prod)
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # HTTPS Listener (requires ACM certificate)
+  # Note: Uncomment and configure when you have an ACM certificate
+  # HTTPSListener:
+  #   Type: AWS::ElasticLoadBalancingV2::Listener
+  #   Properties:
+  #     LoadBalancerArn: !Ref ApplicationLoadBalancer
+  #     Port: 443
+  #     Protocol: HTTPS
+  #     SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+  #     Certificates:
+  #       - CertificateArn: !Ref ACMCertificateArn
+  #     DefaultActions:
+  #       - Type: forward
+  #         TargetGroupArn: !Ref ApiTargetGroup
+
+  # Target Group for API Service
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-api-tg
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-VpcId
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target Group for WebSocket Service
+  WsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-ws-tg
+      Port: 3001
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-VpcId
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        # Enable stickiness for WebSocket connections
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Listener Rules for HTTP (for dev without HTTPS)
+  ApiListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/api/*'
+              - '/health'
+              - '/healthz'
+              - '/readyz'
+              - '/v1/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # WebSocket Listener Rule for webchat connections
+  # Note: For trusted-proxy auth with webchat embedding, the upstream proxy/website
+  # must set X-Forwarded-User header. ALB forwards all headers by default.
+  # Configure gateway.trustedProxies in openclaw.config.yaml to whitelist proxy IPs.
+  WsListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/ws/*'
+              - '/socket.io/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WsTargetGroup
+
+  # HTTPS Listener Rule for WebSocket with OIDC authentication (for webchat embedding)
+  # Note: Requires ACM certificate and OIDC IdP configuration
+  # WsAuthListenerRule:
+  #   Type: AWS::ElasticLoadBalancingV2::ListenerRule
+  #   Properties:
+  #     ListenerArn: !Ref HTTPSListener
+  #     Priority: 15
+  #     Conditions:
+  #       - Field: path-pattern
+  #         PathPatternConfig:
+  #           Values:
+  #             - '/ws/webchat/*'
+  #     Actions:
+  #       # Step 1: Authenticate with OIDC (e.g., Auth0, Okta, Cognito)
+  #       - Type: authenticate-oidc
+  #         Order: 1
+  #         AuthenticateOidcConfig:
+  #           Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+  #           AuthorizationEndpoint: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize"
+  #           TokenEndpoint: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+  #           UserInfoEndpoint: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo"
+  #           ClientId: !Ref UserPoolClientId
+  #           ClientSecret: !Ref UserPoolClientSecret
+  #           SessionCookieName: AWSELBAuthSessionCookie
+  #           SessionTimeout: 604800
+  #           Scope: openid email
+  #           OnUnauthenticatedRequest: authenticate
+  #       # Step 2: Forward to WebSocket service (ALB adds x-amzn-oidc-* headers)
+  #       - Type: forward
+  #         Order: 2
+  #         TargetGroupArn: !Ref WsTargetGroup
+
+  # CloudWatch Log Groups
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/api
+      RetentionInDays: !If [IsProd, 30, 7]
+
+  WsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/ws
+      RetentionInDays: !If [IsProd, 30, 7]
+
+  WorkersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}/workers
+      RetentionInDays: !If [IsProd, 30, 7]
+
+  # ECS Task Definition for API
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-api
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ApiCpu
+      Memory: !Ref ApiMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ECSTaskExecutionRoleArn
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ECSTaskRoleArn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub
+            - '${RepoUri}:latest'
+            - RepoUri: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-ApiECRUri
+          Essential: true
+          Command:
+            - node
+            - openclaw.mjs
+            - gateway
+            - --allow-unconfigured
+            - --bind
+            - lan
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: OPENCLAW_GATEWAY_PORT
+              Value: '3000'
+            - Name: OPENCLAW_GATEWAY_BIND
+              Value: lan
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-RDSEndpoint
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_NAME
+              Value: hana
+            - Name: REDIS_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-RedisEndpoint
+            - Name: REDIS_PORT
+              Value: '6379'
+            - Name: SQS_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-AgentRunsQueueUrl
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RDSSecretArn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RDSSecretArn
+            - Name: REDIS_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RedisSecretArn
+            - Name: JWT_SECRET
+              ValueFrom: !Sub
+                - '${SecretArn}:secret::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-JWTSecretArn
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:api_key::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-AnthropicSecretArn
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:api_key::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-OpenAISecretArn
+            - Name: OPENCLAW_GATEWAY_TOKEN
+              ValueFrom: !Sub
+                - '${SecretArn}:token::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-GatewayTokenSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'node -e "const http = require(\"http\"); http.get(\"http://localhost:3000/health\", (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }).on(\"error\", () => process.exit(1));"'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Definition for WebSocket
+  WsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-ws
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ApiCpu
+      Memory: !Ref ApiMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ECSTaskExecutionRoleArn
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ECSTaskRoleArn
+      ContainerDefinitions:
+        - Name: ws
+          Image: !Sub
+            - '${RepoUri}:latest'
+            - RepoUri: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-ApiECRUri
+          Essential: true
+          Command:
+            - node
+            - openclaw.mjs
+            - gateway
+            - --allow-unconfigured
+            - --bind
+            - lan
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: OPENCLAW_GATEWAY_PORT
+              Value: '3001'
+            - Name: OPENCLAW_GATEWAY_BIND
+              Value: lan
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-RDSEndpoint
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_NAME
+              Value: hana
+            - Name: REDIS_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-RedisEndpoint
+            - Name: REDIS_PORT
+              Value: '6379'
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RDSSecretArn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RDSSecretArn
+            - Name: REDIS_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RedisSecretArn
+            - Name: JWT_SECRET
+              ValueFrom: !Sub
+                - '${SecretArn}:secret::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-JWTSecretArn
+            - Name: OPENCLAW_GATEWAY_TOKEN
+              ValueFrom: !Sub
+                - '${SecretArn}:token::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-GatewayTokenSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ws
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'node -e "const http = require(\"http\"); http.get(\"http://localhost:3001/health\", (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }).on(\"error\", () => process.exit(1));"'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Definition for Workers
+  WorkersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-workers
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref WorkersCpu
+      Memory: !Ref WorkersMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ECSTaskExecutionRoleArn
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ECSTaskRoleArn
+      ContainerDefinitions:
+        - Name: workers
+          Image: !Sub
+            - '${RepoUri}:latest'
+            - RepoUri: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-ApiECRUri
+          Essential: true
+          Command:
+            - node
+            - openclaw.mjs
+            - gateway
+            - --allow-unconfigured
+            - --bind
+            - lan
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-RDSEndpoint
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_NAME
+              Value: hana
+            - Name: REDIS_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-RedisEndpoint
+            - Name: REDIS_PORT
+              Value: '6379'
+            - Name: SQS_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-${Environment}-AgentRunsQueueUrl
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RDSSecretArn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RDSSecretArn
+            - Name: REDIS_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-RedisSecretArn
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:api_key::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-AnthropicSecretArn
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:api_key::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: ${ProjectName}-${Environment}-OpenAISecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: workers
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service for API
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ApiListenerRule
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-api
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ApiTaskDefinition
+      DesiredCount: !Ref ApiDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-ECSSecurityGroupId
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-PrivateSubnet1Id
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-PrivateSubnet2Id
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 3000
+          TargetGroupArn: !Ref ApiTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service for WebSocket
+  WsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - WsListenerRule
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-ws
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WsTaskDefinition
+      DesiredCount: !Ref ApiDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-ECSSecurityGroupId
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-PrivateSubnet1Id
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-PrivateSubnet2Id
+      LoadBalancers:
+        - ContainerName: ws
+          ContainerPort: 3001
+          TargetGroupArn: !Ref WsTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service for Workers
+  WorkersService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-workers
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkersTaskDefinition
+      DesiredCount: !Ref WorkersDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-ECSSecurityGroupId
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-PrivateSubnet1Id
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-${Environment}-PrivateSubnet2Id
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Auto Scaling for API Service
+  ApiScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !If [IsProd, 20, 4]
+      MinCapacity: !If [IsProd, 2, 1]
+      ResourceId: !Sub service/${ECSCluster}/${ApiService.Name}
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ApiScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-api-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ApiScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+Outputs:
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ClusterName
+
+  ClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ClusterArn
+
+  ALBDNSName:
+    Description: ALB DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ALBDNSName
+
+  ALBArn:
+    Description: ALB ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ALBArn
+
+  ApiServiceName:
+    Description: API Service name
+    Value: !GetAtt ApiService.Name
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ApiServiceName
+
+  WsServiceName:
+    Description: WebSocket Service name
+    Value: !GetAtt WsService.Name
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-WsServiceName
+
+  WorkersServiceName:
+    Description: Workers Service name
+    Value: !GetAtt WorkersService.Name
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-WorkersServiceName

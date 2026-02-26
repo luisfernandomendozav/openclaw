@@ -1,0 +1,17 @@
+{
+  // Hana gateway config
+  // Auth: none (ALB is the security boundary for dev)
+  // For production: add a WebSocket proxy in Next.js backend that
+  // passes x-forwarded-user + x-forwarded-host and enable trusted-proxy mode.
+  "gateway": {
+    "bind": "lan",
+    "auth": {
+      "mode": "none"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/root/.openclaw/workspace"
+    }
+  }
+}

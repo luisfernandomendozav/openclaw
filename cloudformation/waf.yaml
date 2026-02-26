@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA WAF Infrastructure - Web Application Firewall
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  RateLimitPerIP:
+    Type: Number
+    Default: 2000
+    Description: Rate limit per IP address (requests per 5 minutes)
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # WAF Web ACL
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-waf
+      Description: WAF rules for HANA API protection
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-${Environment}-waf
+      Rules:
+        # AWS Managed Rules - Core Rule Set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: CrossSiteScripting_BODY
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        # AWS Managed Rules - Known Bad Inputs
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+        # AWS Managed Rules - SQL Injection
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSet
+
+        # Rate Limiting Rule
+        - Name: RateLimitRule
+          Priority: 10
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerIP
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+
+        # Block requests with no User-Agent (bots)
+        - Name: BlockNoUserAgent
+          Priority: 20
+          Action:
+            Block: {}
+          Statement:
+            SizeConstraintStatement:
+              FieldToMatch:
+                SingleHeader:
+                  Name: user-agent
+              ComparisonOperator: EQ
+              Size: 0
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockNoUserAgent
+
+        # Geographic restrictions (example - customize as needed)
+        # Uncomment to enable geo-blocking
+        # - Name: GeoBlockRule
+        #   Priority: 30
+        #   Action:
+        #     Block: {}
+        #   Statement:
+        #     GeoMatchStatement:
+        #       CountryCodes:
+        #         - RU
+        #         - CN
+        #         - KP
+        #   VisibilityConfig:
+        #     SampledRequestsEnabled: true
+        #     CloudWatchMetricsEnabled: true
+        #     MetricName: GeoBlockRule
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Associate WAF with ALB
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !ImportValue
+        Fn::Sub: ${ProjectName}-${Environment}-ALBArn
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # CloudWatch Alarms for WAF
+  WAFBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-waf-blocked-requests-high
+      AlarmDescription: High number of requests blocked by WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !If [IsProd, 1000, 500]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub ${ProjectName}-${Environment}-waf
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+
+  RateLimitTriggeredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-rate-limit-triggered
+      AlarmDescription: Rate limiting rule is being triggered frequently
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub ${ProjectName}-${Environment}-waf
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: RateLimitRule
+
+Outputs:
+  WebACLArn:
+    Description: WAF Web ACL ARN
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-WebACLArn
+
+  WebACLId:
+    Description: WAF Web ACL ID
+    Value: !GetAtt WebACL.Id
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-WebACLId

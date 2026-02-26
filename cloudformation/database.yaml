@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA Database Infrastructure - RDS PostgreSQL and ElastiCache Redis
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    Description: RDS instance class
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r6g.large
+      - db.r6g.xlarge
+
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.medium
+    Description: ElastiCache node type
+    AllowedValues:
+      - cache.t4g.micro
+      - cache.t4g.small
+      - cache.t4g.medium
+      - cache.r6g.large
+      - cache.r6g.xlarge
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # RDS Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${ProjectName}-${Environment}-db-subnet-group
+      DBSubnetGroupDescription: Subnet group for RDS PostgreSQL
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-DatabaseSubnet1Id
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-DatabaseSubnet2Id
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS PostgreSQL Instance
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${Environment}-postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: '16'
+      AllocatedStorage: !If [IsProd, 100, 20]
+      MaxAllocatedStorage: !If [IsProd, 500, 100]
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: hana
+      MasterUsername: !Sub '{{resolve:secretsmanager:${ProjectName}/${Environment}/rds-master:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${ProjectName}/${Environment}/rds-master:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-RDSSecurityGroupId
+      MultiAZ: !If [IsProd, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !If [IsProd, 30, 7]
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If [IsProd, 731, 7]
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      DeletionProtection: !If [IsProd, true, false]
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ElastiCache Subnet Group
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub ${ProjectName}-${Environment}-redis-subnet-group
+      Description: Subnet group for ElastiCache Redis
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-DatabaseSubnet1Id
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-DatabaseSubnet2Id
+
+  # ElastiCache Redis Replication Group
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${ProjectName}-${Environment}-redis
+      ReplicationGroupDescription: Redis cluster for HANA caching and rate limiting
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: !Ref RedisNodeType
+      NumNodeGroups: 1
+      ReplicasPerNodeGroup: !If [IsProd, 1, 0]
+      AutomaticFailoverEnabled: !If [IsProd, true, false]
+      MultiAZEnabled: !If [IsProd, true, false]
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-${Environment}-RedisSecurityGroupId
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      AuthToken: !Sub '{{resolve:secretsmanager:${ProjectName}/${Environment}/redis-auth:SecretString:password}}'
+      SnapshotRetentionLimit: !If [IsProd, 7, 1]
+      SnapshotWindow: '03:00-05:00'
+      PreferredMaintenanceWindow: 'sun:05:00-sun:07:00'
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms for RDS
+  RDSCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-rds-cpu-high
+      AlarmDescription: RDS CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+
+  RDSStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-rds-storage-low
+      AlarmDescription: RDS free storage space is low
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5368709120  # 5 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+
+  RDSConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-rds-connections-high
+      AlarmDescription: RDS database connections are high
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+
+  # CloudWatch Alarms for Redis
+  RedisCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-redis-cpu-high
+      AlarmDescription: Redis CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ReplicationGroupId
+          Value: !Ref RedisReplicationGroup
+
+  RedisMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-redis-memory-high
+      AlarmDescription: Redis memory usage is high
+      MetricName: DatabaseMemoryUsagePercentage
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ReplicationGroupId
+          Value: !Ref RedisReplicationGroup
+
+Outputs:
+  RDSEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RDSEndpoint
+
+  RDSPort:
+    Description: RDS PostgreSQL port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RDSPort
+
+  RDSInstanceId:
+    Description: RDS Instance identifier
+    Value: !Ref RDSInstance
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RDSInstanceId
+
+  RedisEndpoint:
+    Description: Redis primary endpoint
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RedisEndpoint
+
+  RedisPort:
+    Description: Redis port
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RedisPort
+
+  RedisReplicationGroupId:
+    Description: Redis Replication Group ID
+    Value: !Ref RedisReplicationGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-RedisReplicationGroupId

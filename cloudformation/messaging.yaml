@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HANA Messaging Infrastructure - SQS Queues for Agent Runs
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hana
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # Dead Letter Queue for failed agent runs
+  AgentRunsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-agent-runs-dlq.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Main queue for agent runs (FIFO for ordered processing per session)
+  AgentRunsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-agent-runs.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 300  # 5 minutes
+      MessageRetentionPeriod: 86400  # 1 day
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      KmsMasterKeyId: alias/aws/sqs
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AgentRunsDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Queue for async notifications (webhooks, emails)
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-notifications
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400  # 1 day
+      ReceiveMessageWaitTimeSeconds: 20
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Queue for analytics/logging events
+  AnalyticsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-analytics
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 259200  # 3 days
+      ReceiveMessageWaitTimeSeconds: 20
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  AgentRunsQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-agent-runs-queue-depth
+      AlarmDescription: Agent runs queue depth is high
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProd, 100, 50]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AgentRunsQueue.QueueName
+
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-dlq-messages
+      AlarmDescription: Messages are appearing in the dead letter queue
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AgentRunsDLQ.QueueName
+
+Outputs:
+  AgentRunsQueueUrl:
+    Description: SQS Queue URL for agent runs
+    Value: !Ref AgentRunsQueue
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AgentRunsQueueUrl
+
+  AgentRunsQueueArn:
+    Description: SQS Queue ARN for agent runs
+    Value: !GetAtt AgentRunsQueue.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AgentRunsQueueArn
+
+  AgentRunsDLQUrl:
+    Description: SQS DLQ URL for failed agent runs
+    Value: !Ref AgentRunsDLQ
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AgentRunsDLQUrl
+
+  AgentRunsDLQArn:
+    Description: SQS DLQ ARN for failed agent runs
+    Value: !GetAtt AgentRunsDLQ.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AgentRunsDLQArn
+
+  NotificationsQueueUrl:
+    Description: SQS Queue URL for notifications
+    Value: !Ref NotificationsQueue
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-NotificationsQueueUrl
+
+  NotificationsQueueArn:
+    Description: SQS Queue ARN for notifications
+    Value: !GetAtt NotificationsQueue.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-NotificationsQueueArn
+
+  AnalyticsQueueUrl:
+    Description: SQS Queue URL for analytics
+    Value: !Ref AnalyticsQueue
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AnalyticsQueueUrl
+
+  AnalyticsQueueArn:
+    Description: SQS Queue ARN for analytics
+    Value: !GetAtt AnalyticsQueue.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AnalyticsQueueArn
