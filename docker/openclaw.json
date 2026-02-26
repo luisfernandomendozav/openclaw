@@ -1,0 +1,23 @@
+{
+  // Hana production gateway config
+  // Auth handled via trusted-proxy (ALB / Next.js backend acts as proxy)
+  "gateway": {
+    "bind": "lan",
+    // ALB and ECS task internal IPs are within the VPC 10.0.0.0/16
+    "trustedProxies": ["10.0.0.0/16", "127.0.0.1"],
+    "auth": {
+      "mode": "trusted-proxy",
+      "trustedProxy": {
+        // Next.js backend passes authenticated user identity (or guest session ID)
+        "userHeader": "x-forwarded-user",
+        // Required so we know the request came through the proxy
+        "requiredHeaders": ["x-forwarded-host"]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/root/.openclaw/workspace"
+    }
+  }
+}
