@@ -89,6 +89,56 @@ Complete AWS infrastructure for HANA deployed via CloudFormation.
 
 ---
 
+## Gateway Authentication (Trusted Proxy Mode)
+
+When deploying Hana behind an AWS ALB (or other identity-aware reverse proxy), use **trusted-proxy** auth mode. This allows the ALB to handle authentication and pass user identity via headers.
+
+### Configuration
+
+Add to your `~/.openclaw/config.yaml` or environment-specific config:
+
+```yaml
+gateway:
+  auth:
+    mode: trusted-proxy
+    trustedProxy:
+      # Header containing authenticated user identity (set by ALB/proxy)
+      userHeader: x-forwarded-user
+      # Additional headers that MUST be present to trust the request
+      requiredHeaders:
+        - x-forwarded-proto
+        - x-forwarded-host
+      # Optional: restrict to specific users (empty = allow all authenticated users)
+      allowUsers: []
+  # CIDR ranges of trusted proxies (ALB internal IPs)
+  trustedProxies:
+    - "10.0.0.0/16" # VPC CIDR
+```
+
+### Environment Variables
+
+Alternatively, configure via environment:
+
+```bash
+OPENCLAW_GATEWAY_AUTH_MODE=trusted-proxy
+OPENCLAW_GATEWAY_TRUSTED_PROXY_USER_HEADER=x-forwarded-user
+```
+
+### How It Works
+
+1. ALB authenticates the user (via Cognito, OIDC, etc.)
+2. ALB adds `x-forwarded-user` header with authenticated user identity
+3. Hana validates the request came from a trusted proxy (ALB IP in VPC CIDR)
+4. Hana extracts user identity from the configured header
+
+### Security Considerations
+
+- **trustedProxies** MUST be configured to only include ALB/proxy IP ranges
+- Requests from non-trusted IPs are rejected even with valid headers
+- This prevents header spoofing from untrusted clients
+
+---
+
 ## Accessing HANA
 
 ### Option 1: Via Load Balancer (Production)
@@ -478,3 +528,164 @@ pnpm aws:logs
 # Check status
 pnpm aws:status
 ```
+
+---
+
+## Webchat Embedding
+
+Hana can be embedded as a webchat widget in external websites (e.g., Hom Next.js website) using trusted-proxy authentication. This allows the hosting website to authenticate users and pass their identity to Hana via HTTP headers.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Hom Next.js Website                                │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                        HanaWidget (React)                            │   │
+│   │   - Establishes WebSocket connection to /ws/chat                    │   │
+│   │   - Sends chat.send messages                                        │   │
+│   │   - Receives chat.history and streaming responses                   │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────┬────────────────────────────────────────┘
+                                     │
+                                     │ WebSocket + X-Forwarded-User header
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Application Load Balancer (ALB)                           │
+│   - Routes /ws/* to WebSocket target group                                  │
+│   - Preserves X-Forwarded-User header from trusted origins                  │
+│   - Enables WebSocket stickiness via lb_cookie                              │
+└────────────────────────────────────┬────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Hana Gateway (ECS Fargate)                           │
+│   - Validates X-Forwarded-User header from trusted proxies                  │
+│   - Creates/resumes sessions per user                                       │
+│   - Streams AI responses back via WebSocket                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Trusted-Proxy Authentication Setup
+
+Trusted-proxy auth allows the ALB (or any upstream proxy) to assert user identity via headers. Hana validates that the request originated from a configured trusted proxy IP before accepting the user header.
+
+#### 1. Configure Trusted Proxies
+
+Update `openclaw.config.yaml` (or use environment variables) to enable trusted-proxy auth:
+
+```yaml
+gateway:
+  auth:
+    mode: trusted-proxy
+    trustedProxy:
+      userHeader: x-forwarded-user # Header containing authenticated user ID
+      requiredHeaders: # Optional: additional required headers
+        - x-forwarded-proto
+      allowUsers: [] # Empty = allow all users, or specify allowlist
+  trustedProxies:
+    - 10.0.0.0/24 # ALB private subnet 1
+    - 10.0.1.0/24 # ALB private subnet 2
+```
+
+#### 2. Environment Variables
+
+Alternatively, configure via environment variables:
+
+```bash
+# In ECS task definition or Secrets Manager
+OPENCLAW_GATEWAY_AUTH_MODE=trusted-proxy
+OPENCLAW_GATEWAY_TRUSTED_PROXY_USER_HEADER=x-forwarded-user
+```
+
+#### 3. ALB Configuration
+
+The ALB must forward the `X-Forwarded-User` header from the upstream application. The CloudFormation template (`cloudformation/compute.yaml`) includes:
+
+- WebSocket target group with sticky sessions (`lb_cookie`)
+- Listener rules that route `/ws/*` to the WebSocket service
+- Header passthrough for trusted proxy authentication
+
+#### 4. Security Considerations
+
+- **Trusted Proxies Only**: Hana only accepts the `X-Forwarded-User` header from IPs listed in `trustedProxies`. Requests from other sources will be rejected.
+- **Header Validation**: The ALB/proxy must set `X-Forwarded-User` only after authenticating the end user.
+- **HTTPS Required**: In production, ensure all traffic between the website and ALB uses HTTPS.
+- **CORS**: Configure CORS headers if the webchat widget runs on a different domain.
+
+### WebSocket Protocol
+
+The webchat widget communicates with Hana using JSON messages over WebSocket:
+
+#### Connect
+
+```javascript
+const ws = new WebSocket("wss://hana-dev-alb.../ws/chat");
+```
+
+#### Request Chat History
+
+```json
+{
+  "type": "chat.history",
+  "id": "req-1",
+  "params": {
+    "sessionKey": "user@example.com",
+    "limit": 100
+  }
+}
+```
+
+#### Send Message
+
+```json
+{
+  "type": "chat.send",
+  "id": "req-2",
+  "params": {
+    "sessionKey": "user@example.com",
+    "message": "Hello, Hana!",
+    "idempotencyKey": "msg-uuid-123"
+  }
+}
+```
+
+#### Receive Streaming Response
+
+Hana broadcasts `chat` events with streaming deltas:
+
+```json
+{
+  "type": "chat",
+  "payload": {
+    "runId": "run-123",
+    "sessionKey": "user@example.com",
+    "seq": 1,
+    "state": "delta",
+    "text": "Hello! "
+  }
+}
+```
+
+Final message includes the complete assistant response:
+
+```json
+{
+  "type": "chat",
+  "payload": {
+    "runId": "run-123",
+    "sessionKey": "user@example.com",
+    "seq": 10,
+    "state": "final",
+    "message": {
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "Hello! How can I help you today?" }],
+      "timestamp": 1708000000000
+    }
+  }
+}
+```
+
+### Embed Instructions
+
+See [WEBCHAT.md](./WEBCHAT.md) for detailed embedding instructions and the React widget code.
