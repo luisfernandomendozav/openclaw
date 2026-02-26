@@ -52,6 +52,7 @@ RUN pnpm ui:build
 ENV NODE_ENV=production
 
 # Hana gateway config: copy trusted-proxy auth config into the image
+USER root
 RUN mkdir -p /root/.openclaw
 COPY docker/openclaw.json /root/.openclaw/openclaw.json
 
